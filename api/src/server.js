@@ -3,28 +3,31 @@ import Fastify from 'fastify'
 import pkg from 'pg'
 import Redis from 'ioredis'
 import crypto from 'crypto'
+import fs from 'fs'
 
 const { Pool } = pkg
-
-// ----- Helpers
 const app = Fastify({ logger: true })
 
-function maskDbUrl(url) {
+// ---------- helpers
+function readMaybeFile(pathOrValue) {
+  if (!pathOrValue) return ''
   try {
-    const u = new URL(url)
-    if (u.username) u.username = '***'
-    if (u.password) u.password = '***'
-    return u.toString()
-  } catch {
-    return '<invalid>'
-  }
+    // Als het een bestaand pad is: lees het (voor secrets)
+    if (fs.existsSync(pathOrValue)) {
+      return fs.readFileSync(pathOrValue, 'utf8')
+    }
+  } catch {}
+  return String(pathOrValue)
+}
+
+function trimIfString(v) {
+  return typeof v === 'string' ? v.trim() : v
 }
 
 function normalizeAnswer(s) {
   return String(s || '').trim().toLowerCase().replace(/\s+/g, ' ')
 }
 
-// simple scrypt verify for 'plain:<answer>' or 'scrypt:<salt>:<hexhash>'
 async function verifyAnswer(stored, input) {
   if (!stored) return false
   if (stored.startsWith('plain:')) {
@@ -40,74 +43,129 @@ async function verifyAnswer(stored, input) {
   return stored === normalizeAnswer(input)
 }
 
-// ----- Environment & clients
-const DB_URL = process.env.DATABASE_URL || ''
-const REDIS_URL = process.env.REDIS_URL || ''
+function maskValue(v, keep = 2) {
+  if (!v) return ''
+  const s = String(v)
+  if (s.length <= keep) return '*'.repeat(s.length)
+  return s.slice(0, keep) + '*'.repeat(Math.max(0, s.length - keep))
+}
 
-// Validate DATABASE_URL early with friendly logs
-(function validateDbUrl() {
-  if (!DB_URL) {
-    app.log.error('DATABASE_URL ontbreekt.')
-    process.exit(1)
+function maskDbConfig(c) {
+  return {
+    host: c.host,
+    port: c.port,
+    database: c.database,
+    user: c.user ? maskValue(c.user) : '',
+    password: c.password ? `${'*'.repeat(Math.min(12, String(c.password).length))} (len=${String(c.password).length})` : '<none>',
+    ssl: !!c.ssl,
   }
-  let u
-  try {
-    u = new URL(DB_URL)
-  } catch (e) {
-    app.log.error({ msg: 'Ongeldige DATABASE_URL', detail: String(e) })
-    process.exit(1)
-  }
-  if (!/^postgres(ql)?:$/.test(u.protocol)) {
-    app.log.error(`DATABASE_URL protocol moet postgres:// of postgresql:// zijn (nu: ${u.protocol})`)
-    process.exit(1)
-  }
-  // Als wachtwoord niet aanwezig is, geeft URL.password een lege string => falsy
-  if (!u.password) {
-    app.log.error(
-      `DATABASE_URL mist het wachtwoord-gedeelte (user:password@...). Huidige (gemaskeerd): ${maskDbUrl(DB_URL)}`
-    )
-    process.exit(1)
-  }
-})()
+}
 
-// Optioneel SSL naar Postgres via env toggle (voor bv. managed PG)
-const pgUseSsl =
-  (process.env.PGSSL || process.env.DATABASE_SSL || '').toLowerCase() === 'require'
+// ---------- DB config (URL of losse env of *_FILE)
+function getDbConfigFromEnv() {
+  // 1) DATABASE_URL of DATABASE_URL_FILE
+  let dbUrl = trimIfString(process.env.DATABASE_URL)
+  const dbUrlFile = trimIfString(process.env.DATABASE_URL_FILE)
+  if (!dbUrl && dbUrlFile) dbUrl = trimIfString(readMaybeFile(dbUrlFile))
 
-const pool = new Pool({
-  connectionString: DB_URL,
-  ...(pgUseSsl ? { ssl: { rejectUnauthorized: false } } : {}),
-})
+  // 2) Losse PG* env (met *_FILE support)
+  const PGHOST = trimIfString(process.env.PGHOST) || undefined
+  const PGPORT = process.env.PGPORT ? Number(process.env.PGPORT) : undefined
+  const PGDATABASE = trimIfString(process.env.PGDATABASE) || undefined
+  const PGUSER = trimIfString(process.env.PGUSER) || undefined
+  let PGPASSWORD = trimIfString(process.env.PGPASSWORD) || undefined
+  const PGPASSWORD_FILE = trimIfString(process.env.PGPASSWORD_FILE)
+  if (!PGPASSWORD && PGPASSWORD_FILE) {
+    PGPASSWORD = trimIfString(readMaybeFile(PGPASSWORD_FILE))
+  }
 
-// Redis is optioneel; rate limiting schakelt dan uit
+  // SSL toggles
+  const sslToggle = (process.env.PGSSL || process.env.DATABASE_SSL || '').toLowerCase()
+  const wantSsl = sslToggle === 'require' || sslToggle === 'true'
+  let ssl = wantSsl ? { rejectUnauthorized: false } : undefined
+
+  if (dbUrl) {
+    try {
+      const u = new URL(dbUrl)
+      if (!/^postgres(ql)?:$/.test(u.protocol)) {
+        throw new Error(`Protocol moet postgres:// of postgresql:// zijn (nu: ${u.protocol})`)
+      }
+      // Wachtwoord kan in authority óf als search param staan
+      let password = u.password
+      const qpPassword = u.searchParams.get('password')
+      if (!password && qpPassword) password = qpPassword
+
+      const port = u.port ? Number(u.port) : 5432
+      const sslmode = (u.searchParams.get('sslmode') || '').toLowerCase()
+      if (sslmode === 'require' || sslmode === 'prefer' || sslmode === 'verify-full') {
+        ssl = { rejectUnauthorized: false }
+      }
+
+      return {
+        host: u.hostname,
+        port,
+        database: u.pathname.replace(/^\//, '') || undefined,
+        user: decodeURIComponent(u.username || ''),
+        password: typeof password === 'string' ? decodeURIComponent(password) : password,
+        ssl,
+      }
+    } catch (e) {
+      app.log.error({ msg: 'Ongeldige DATABASE_URL', detail: String(e) })
+      process.exit(1)
+    }
+  }
+
+  // Val terug op losse PG* variabelen
+  return {
+    host: PGHOST,
+    port: PGPORT || 5432,
+    database: PGDATABASE,
+    user: PGUSER,
+    password: PGPASSWORD,
+    ssl,
+  }
+}
+
+const dbConfig = getDbConfigFromEnv()
+
+// Validatie: alles moet aanwezig zijn en password moet string zijn
+if (!dbConfig.host || !dbConfig.database || !dbConfig.user) {
+  app.log.error({ msg: 'DB configuratie onvolledig', config: maskDbConfig(dbConfig) })
+  process.exit(1)
+}
+if (typeof dbConfig.password !== 'string' || dbConfig.password === '') {
+  app.log.error({ msg: 'DB wachtwoord ontbreekt of is geen string', config: maskDbConfig(dbConfig) })
+  process.exit(1)
+}
+
+const pool = new Pool(dbConfig)
+
+// Redis optioneel
 let redis = null
+const REDIS_URL = process.env.REDIS_URL || ''
 if (REDIS_URL) {
   redis = new Redis(REDIS_URL)
   redis.on('error', (err) => app.log.warn({ msg: 'Redis error', err: String(err) }))
 } else {
-  app.log.warn('REDIS_URL niet gezet — rate limiting voor /api/stops/answer is uitgeschakeld.')
+  app.log.warn('REDIS_URL niet gezet — rate limiting is uit.')
 }
 
-// ----- Globale error handler (mooie 500’s met ID)
+// ---------- error handler
 app.setErrorHandler((err, req, reply) => {
   req.log.error(err)
   const showDetail = (process.env.NODE_ENV || 'production') !== 'production'
-  reply.code(500).send({
-    error: 'Internal Server Error',
-    ...(showDetail ? { detail: err.message } : {}),
-  })
+  reply.code(500).send({ error: 'Internal Server Error', ...(showDetail ? { detail: err.message } : {}) })
 })
 
-// ----- Routes
+// ---------- routes
 app.get('/api/health', async () => ({ ok: true }))
 
-// Kleine startup-check endpoint (handig om DB-connect te testen)
-app.get('/api/_dbcheck', async (req, reply) => {
-  const r = await pool.query('SELECT 1 as ok')
+app.get('/api/_dbcheck', async () => {
+  const r = await pool.query('SELECT 1 AS ok')
   return { db: r.rows[0].ok === 1 }
 })
 
-app.post('/api/teams', async (req, reply) => {
+app.post('/api/teams', async (req) => {
   const body = req.body || {}
   const name = (body.name || 'Team').toString().slice(0, 80)
   const join_code = Math.random().toString(36).slice(2, 8).toUpperCase()
@@ -121,10 +179,8 @@ app.post('/api/teams', async (req, reply) => {
 app.post('/api/runs/start', async (req, reply) => {
   const { teamId, routeId } = req.body || {}
   if (!teamId || !routeId) return reply.code(400).send({ error: 'teamId en routeId zijn verplicht' })
-
   const r = await pool.query('SELECT id FROM routes WHERE id=$1 OR title=$1 OR city=$1', [routeId])
   if (!r.rows[0]) return reply.code(404).send({ error: 'Route niet gevonden' })
-
   const ins = await pool.query(
     'INSERT INTO runs (route_id, team_id) VALUES ($1,$2) RETURNING id, started_at',
     [r.rows[0].id, teamId]
@@ -148,7 +204,6 @@ app.post('/api/stops/answer', async (req, reply) => {
   const { runId, stopId, answer } = req.body || {}
   if (!runId || !stopId) return reply.code(400).send({ error: 'runId/stopId verplicht' })
 
-  // Rate-limit met Redis; als Redis ontbreekt of faalt, slaan we RL over
   if (redis) {
     try {
       const key = `rl:${runId}:${stopId}`
@@ -178,10 +233,8 @@ app.post('/api/stops/answer', async (req, reply) => {
 app.post('/api/stops/hint', async (req, reply) => {
   const { runId, stopId } = req.body || {}
   if (!runId || !stopId) return reply.code(400).send({ error: 'runId/stopId verplicht' })
-
   const st = await pool.query('SELECT hint_markdown, hint_penalty FROM stops WHERE id=$1', [stopId])
   if (!st.rows[0]) return reply.code(404).send({ error: 'Stop niet gevonden' })
-
   await pool.query(
     `INSERT INTO progress(team_id, stop_id, used_hint)
      SELECT team_id, $1, true FROM runs WHERE id=$2
@@ -198,19 +251,15 @@ app.post('/api/runs/finish', async (req, reply) => {
   return up.rows[0] || {}
 })
 
-// ----- Startup
 const port = Number(process.env.PORT || 3000)
 
 async function start() {
-  // Proactieve DB check (geeft meteen heldere fout als creds niet kloppen)
   try {
-    const r = await pool.query('SELECT 1')
-    if (r.rows[0]?.['?column?'] !== 1 && r.rows[0]?.ok !== 1) {
-      app.log.warn('Onverwacht DB check-resultaat, maar connectie lijkt oké.')
-    }
-    app.log.info(`Database connectie OK (${maskDbUrl(DB_URL)})`)
+    const r = await pool.query('SELECT 1 AS ok')
+    if (r.rows[0]?.ok !== 1) app.log.warn('Onverwacht DB check-resultaat, maar connectie lijkt oké.')
+    app.log.info({ msg: 'DB config OK', config: maskDbConfig(dbConfig) })
   } catch (e) {
-    app.log.error({ msg: 'Kan niet verbinden met database', detail: String(e) })
+    app.log.error({ msg: 'Kan niet verbinden met database', detail: String(e), config: maskDbConfig(dbConfig) })
     process.exit(1)
   }
 
@@ -222,10 +271,8 @@ async function start() {
     process.exit(1)
   }
 }
-
 start()
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
   app.log.info('SIGTERM ontvangen, afsluiten...')
   try { await app.close() } catch {}
