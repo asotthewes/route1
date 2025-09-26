@@ -1,0 +1,42 @@
+version: "3.9"
+services:
+  web:
+    build: ./web
+    environment:
+      - VITE_API_BASE=/api
+    ports:
+      - "8080:80"   # test lokaal op http://localhost:8080
+    depends_on: [api]
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    environment:
+      - DATABASE_URL=postgresql://mystery:${POSTGRES_PASSWORD}@db:5432/mystery
+      - REDIS_URL=redis://redis:6379/0
+      - SESSION_SECRET=changeme-session
+      - NODE_ENV=production
+    depends_on: [db, redis]
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=mystery
+      - POSTGRES_USER=mystery
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - pg:/var/lib/postgresql/data
+      - ./api/sql:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis:/data
+    restart: unless-stopped
+
+volumes:
+  pg: {}
+  redis: {}
